@@ -1,0 +1,416 @@
+import 'dart:io';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../live/live_catalog.dart';
+import '../live/live_models.dart';
+import '../live/live_service.dart';
+import '../player/player_controller.dart';
+import '../player/player_models.dart';
+import '../settings/storage_service.dart';
+
+enum AuraTab { player, library, live, playlist, history }
+
+class ActiveTabNotifier extends Notifier<AuraTab> {
+  @override
+  AuraTab build() => AuraTab.library;
+
+  void setTab(AuraTab tab) {
+    state = tab;
+  }
+}
+
+final activeTabProvider =
+    NotifierProvider<ActiveTabNotifier, AuraTab>(ActiveTabNotifier.new);
+
+final liveServiceProvider = Provider<LiveService>((ref) => LiveService());
+
+class LiveTvState {
+  final List<LiveChannel> channels;
+  final Set<String> favoriteIds;
+  final bool isLoading;
+  final String activePresetTitle;
+
+  const LiveTvState({
+    this.channels = const [],
+    this.favoriteIds = const {},
+    this.isLoading = false,
+    this.activePresetTitle = 'Curated Channels',
+  });
+
+  LiveTvState copyWith({
+    List<LiveChannel>? channels,
+    Set<String>? favoriteIds,
+    bool? isLoading,
+    String? activePresetTitle,
+  }) {
+    return LiveTvState(
+      channels: channels ?? this.channels,
+      favoriteIds: favoriteIds ?? this.favoriteIds,
+      isLoading: isLoading ?? this.isLoading,
+      activePresetTitle: activePresetTitle ?? this.activePresetTitle,
+    );
+  }
+}
+
+class LiveTvNotifier extends Notifier<LiveTvState> {
+  late final LiveService _service;
+
+  @override
+  LiveTvState build() {
+    _service = ref.watch(liveServiceProvider);
+    _init();
+    return const LiveTvState(channels: LiveCatalog.defaultChannels);
+  }
+
+  Future<void> _init() async {
+    final favs = await _service.getFavoriteIds();
+    state = state.copyWith(favoriteIds: favs);
+  }
+
+  Future<void> loadPreset(LivePreset preset) async {
+    state = state.copyWith(isLoading: true, activePresetTitle: preset.title);
+    final fetched = await _service.fetchM3u(preset.url);
+    if (fetched.isNotEmpty) {
+      state = state.copyWith(channels: fetched, isLoading: false);
+    } else {
+      state = state.copyWith(isLoading: false);
+    }
+  }
+
+  Future<void> loadCustomM3u(String url) async {
+    state = state.copyWith(isLoading: true, activePresetTitle: 'Custom Playlist');
+    final fetched = await _service.fetchM3u(url);
+    if (fetched.isNotEmpty) {
+      state = state.copyWith(channels: fetched, isLoading: false);
+    } else {
+      state = state.copyWith(isLoading: false);
+    }
+  }
+
+  void resetToCurated() {
+    state = state.copyWith(
+      channels: LiveCatalog.defaultChannels,
+      activePresetTitle: 'Curated Channels',
+    );
+  }
+
+  Future<void> toggleFavorite(String id) async {
+    await _service.toggleFavorite(id);
+    final favs = await _service.getFavoriteIds();
+    state = state.copyWith(favoriteIds: favs);
+  }
+}
+
+final liveTvProvider =
+    NotifierProvider<LiveTvNotifier, LiveTvState>(LiveTvNotifier.new);
+
+final storageServiceProvider = Provider<StorageService>((ref) {
+  throw UnimplementedError('StorageService must be overridden in main');
+});
+
+final playerControllerProvider = Provider<AuraPlayerWrapper>((ref) {
+  final storage = ref.watch(storageServiceProvider);
+  final wrapper = AuraPlayerWrapper(storageService: storage);
+  ref.onDispose(() => wrapper.dispose());
+  return wrapper;
+});
+
+class PlaylistState {
+  final List<PlaylistItem> items;
+  final int currentIndex;
+
+  const PlaylistState({
+    this.items = const [],
+    this.currentIndex = -1,
+  });
+
+  bool get hasItems => items.isNotEmpty;
+  bool get hasNext => currentIndex >= 0 && currentIndex < items.length - 1;
+  bool get hasPrev => currentIndex > 0;
+  PlaylistItem? get currentItem =>
+      (currentIndex >= 0 && currentIndex < items.length) ? items[currentIndex] : null;
+
+  PlaylistState copyWith({
+    List<PlaylistItem>? items,
+    int? currentIndex,
+  }) {
+    return PlaylistState(
+      items: items ?? this.items,
+      currentIndex: currentIndex ?? this.currentIndex,
+    );
+  }
+}
+
+class PlaylistNotifier extends Notifier<PlaylistState> {
+  DateTime? _lastCompletionHandled;
+
+  @override
+  PlaylistState build() {
+    final playerWrapper = ref.watch(playerControllerProvider);
+    playerWrapper.onPlaybackEnded = _handlePlaybackEnded;
+    return const PlaylistState();
+  }
+
+  Future<void> _handlePlaybackEnded() async {
+    final now = DateTime.now();
+    if (_lastCompletionHandled != null &&
+        now.difference(_lastCompletionHandled!).inMilliseconds < 1200) {
+      return;
+    }
+    _lastCompletionHandled = now;
+
+    final playerWrapper = ref.read(playerControllerProvider);
+    if (playerWrapper.isLiveStream) return;
+    if (playerWrapper.currentFilePath == null) return;
+
+    if (state.hasNext) {
+      // Auto-advance to next video in queue and play automatically
+      next();
+    } else {
+      // Otherwise, return to starting point (0:00) and stay paused
+      final currentPath = playerWrapper.currentFilePath;
+      if (currentPath != null) {
+        ref.read(storageServiceProvider).setPosition(currentPath, Duration.zero);
+      }
+      await playerWrapper.pause();
+      await playerWrapper.seek(Duration.zero);
+      await playerWrapper.pause();
+    }
+  }
+
+  void setList(List<PlaylistItem> items, {int initialIndex = 0}) {
+    state = PlaylistState(items: items, currentIndex: initialIndex);
+    if (items.isNotEmpty && initialIndex >= 0 && initialIndex < items.length) {
+      final item = items[initialIndex];
+      ref.read(playerControllerProvider).openFile(item.path, title: item.title);
+      ref.read(activeTabProvider.notifier).setTab(AuraTab.player);
+    }
+  }
+
+  void addItem(PlaylistItem item, {bool playImmediately = false}) {
+    final updated = [...state.items, item];
+    if (playImmediately || state.currentIndex == -1) {
+      state = state.copyWith(items: updated, currentIndex: updated.length - 1);
+      ref.read(playerControllerProvider).openFile(item.path, title: item.title);
+      ref.read(activeTabProvider.notifier).setTab(AuraTab.player);
+    } else {
+      state = state.copyWith(items: updated);
+    }
+  }
+
+  void removeItem(int index) {
+    if (index < 0 || index >= state.items.length) return;
+    final updated = [...state.items]..removeAt(index);
+    var newIdx = state.currentIndex;
+    if (index == state.currentIndex) {
+      if (updated.isEmpty) {
+        newIdx = -1;
+        ref.read(playerControllerProvider).stop();
+        ref.read(activeTabProvider.notifier).setTab(AuraTab.library);
+      } else {
+        newIdx = index >= updated.length ? updated.length - 1 : index;
+        final nextItem = updated[newIdx];
+        ref.read(playerControllerProvider).openFile(nextItem.path, title: nextItem.title);
+      }
+    } else if (index < state.currentIndex) {
+      newIdx--;
+    }
+    state = state.copyWith(items: updated, currentIndex: newIdx);
+  }
+
+  void playIndex(int index) {
+    if (index >= 0 && index < state.items.length) {
+      final item = state.items[index];
+      state = state.copyWith(currentIndex: index);
+      ref.read(playerControllerProvider).openFile(item.path, title: item.title);
+      ref.read(activeTabProvider.notifier).setTab(AuraTab.player);
+    }
+  }
+
+  void next() {
+    if (state.hasNext) {
+      playIndex(state.currentIndex + 1);
+    }
+  }
+
+  void prev() {
+    if (state.hasPrev) {
+      playIndex(state.currentIndex - 1);
+    }
+  }
+
+  void clearQueue() {
+    if (state.currentIndex >= 0 && state.currentIndex < state.items.length) {
+      final current = state.items[state.currentIndex];
+      state = PlaylistState(items: [current], currentIndex: 0);
+    } else {
+      state = const PlaylistState();
+    }
+  }
+
+  Future<void> stopAndClose() async {
+    await ref.read(playerControllerProvider).stop();
+    state = const PlaylistState();
+    ref.read(windowControlsProvider.notifier).closePlaylist();
+    final isDesktop = Platform.isWindows || Platform.isLinux || Platform.isMacOS;
+    if (!isDesktop) {
+      try {
+        SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+        SystemChrome.setPreferredOrientations([
+          DeviceOrientation.portraitUp,
+          DeviceOrientation.portraitDown,
+          DeviceOrientation.landscapeLeft,
+          DeviceOrientation.landscapeRight,
+        ]);
+      } catch (_) {}
+    }
+    ref.read(activeTabProvider.notifier).setTab(AuraTab.library);
+  }
+}
+
+final playlistProvider =
+    NotifierProvider<PlaylistNotifier, PlaylistState>(PlaylistNotifier.new);
+
+// Window Mode State
+class WindowControlsState {
+  final bool isAlwaysOnTop;
+  final bool isMiniMode;
+  final bool isFullscreen;
+  final bool isPlaylistOpen;
+  final bool isInspectorOpen;
+  final int inspectorTab; // 0: Video, 1: Audio & EQ, 2: Subtitles, 3: Media Info
+
+  const WindowControlsState({
+    this.isAlwaysOnTop = false,
+    this.isMiniMode = false,
+    this.isFullscreen = false,
+    this.isPlaylistOpen = false,
+    this.isInspectorOpen = false,
+    this.inspectorTab = 0,
+  });
+
+  WindowControlsState copyWith({
+    bool? isAlwaysOnTop,
+    bool? isMiniMode,
+    bool? isFullscreen,
+    bool? isPlaylistOpen,
+    bool? isInspectorOpen,
+    int? inspectorTab,
+  }) {
+    return WindowControlsState(
+      isAlwaysOnTop: isAlwaysOnTop ?? this.isAlwaysOnTop,
+      isMiniMode: isMiniMode ?? this.isMiniMode,
+      isFullscreen: isFullscreen ?? this.isFullscreen,
+      isPlaylistOpen: isPlaylistOpen ?? this.isPlaylistOpen,
+      isInspectorOpen: isInspectorOpen ?? this.isInspectorOpen,
+      inspectorTab: inspectorTab ?? this.inspectorTab,
+    );
+  }
+}
+
+class WindowControlsNotifier extends Notifier<WindowControlsState> {
+  @override
+  WindowControlsState build() => const WindowControlsState();
+
+  Future<void> toggleAlwaysOnTop() async {
+    final next = !state.isAlwaysOnTop;
+    state = state.copyWith(isAlwaysOnTop: next);
+  }
+
+  Future<void> toggleFullscreen() async {
+    final next = !state.isFullscreen;
+    try {
+      if (next) {
+        SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+        SystemChrome.setPreferredOrientations([
+          DeviceOrientation.landscapeLeft,
+          DeviceOrientation.landscapeRight,
+        ]);
+      } else {
+        SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+        SystemChrome.setPreferredOrientations([
+          DeviceOrientation.portraitUp,
+          DeviceOrientation.portraitDown,
+          DeviceOrientation.landscapeLeft,
+          DeviceOrientation.landscapeRight,
+        ]);
+      }
+    } catch (_) {}
+    state = state.copyWith(isFullscreen: next);
+  }
+
+  Future<void> toggleMiniMode() async {
+    final next = !state.isMiniMode;
+    state = state.copyWith(isMiniMode: next, isFullscreen: false);
+  }
+
+  void togglePlaylist() {
+    final next = !state.isPlaylistOpen;
+    state = state.copyWith(
+      isPlaylistOpen: next,
+      isInspectorOpen: next ? false : state.isInspectorOpen,
+    );
+  }
+
+  void closePlaylist() {
+    if (state.isPlaylistOpen) {
+      state = state.copyWith(isPlaylistOpen: false);
+    }
+  }
+
+  void toggleInspector({int? tab}) {
+    if (state.isInspectorOpen && (tab == null || tab == state.inspectorTab)) {
+      state = state.copyWith(isInspectorOpen: false);
+    } else {
+      state = state.copyWith(
+        isInspectorOpen: true,
+        inspectorTab: tab ?? state.inspectorTab,
+        isPlaylistOpen: false,
+      );
+    }
+  }
+
+  void openInspector({int tab = 0}) {
+    state = state.copyWith(
+      isInspectorOpen: true,
+      inspectorTab: tab,
+      isPlaylistOpen: false,
+    );
+  }
+
+  void closeInspector() {
+    if (state.isInspectorOpen) {
+      state = state.copyWith(isInspectorOpen: false);
+    }
+  }
+}
+
+final windowControlsProvider =
+    NotifierProvider<WindowControlsNotifier, WindowControlsState>(
+        WindowControlsNotifier.new);
+
+class ThemeModeNotifier extends Notifier<ThemeMode> {
+  late final StorageService _storage;
+
+  @override
+  ThemeMode build() {
+    _storage = ref.watch(storageServiceProvider);
+    final saved = _storage.getThemeMode();
+    return saved == 'light' ? ThemeMode.light : ThemeMode.dark;
+  }
+
+  Future<void> toggleTheme() async {
+    final next = state == ThemeMode.dark ? ThemeMode.light : ThemeMode.dark;
+    state = next;
+    await _storage.setThemeMode(next == ThemeMode.light ? 'light' : 'dark');
+  }
+
+  Future<void> setTheme(ThemeMode mode) async {
+    state = mode;
+    await _storage.setThemeMode(mode == ThemeMode.light ? 'light' : 'dark');
+  }
+}
+
+final themeModeProvider =
+    NotifierProvider<ThemeModeNotifier, ThemeMode>(ThemeModeNotifier.new);
